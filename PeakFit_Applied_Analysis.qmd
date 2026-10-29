@@ -1,0 +1,319 @@
+---
+title: "Peak Fit Applied Analysis"
+author: "Koushik Dhulipala"
+date: "2026-10-15"
+date-modified: today
+format:
+  pdf:
+    toc: true
+    colorlinks: true
+    documentclass: scrartcl
+    fontsize: 11pt
+    geometry:
+      - margin=1in
+    mainfont: "Open Sans" 
+    sansfont: "Open Sans"
+    highlight-style: arrow
+    include-in-header:
+      text: |
+        \usepackage[most]{tcolorbox}
+
+        \renewenvironment{quote}
+          {\begin{tcolorbox}[
+            colback=gray!5,
+            colframe=purple!50!black,
+            enhanced,
+            breakable]}
+          {\end{tcolorbox}}
+---
+
+# Setup
+
+```{r}
+#| label: setup
+
+## PACKAGES
+library(tidyverse)
+library(easystats)   # parameters, performance, modelbased, datawizard, insight, etc.
+library(here)
+library(sandwich)    # robust (HC3) standard errors; added in case I need it
+
+## DATA
+members <- here("peakfit_members.csv") |>
+  read_csv()
+
+```
+
+# Section 4: Applied R Analysis
+
+## Data preparation
+
+```{r}
+#| label: prep
+glimpse(members)
+
+# check for missing values 
+members |>
+  summarize(across(everything(), \(x) sum(is.na(x)))) |>
+  display()
+
+members <- members |>
+  mutate(
+    # creates reference levels: Basic tier; Walk-in channel; Suburban location
+    membership_tier     = factor(membership_tier,
+                                 levels = c("Basic", "Premium", "Elite")),
+    acquisition_channel = factor(acquisition_channel,
+                                 levels = c("Walk-in", "Referral", "Social Ad")),
+    home_location       = factor(home_location,
+                                 levels = c("Suburban", "Urban")),
+    # outcome for RQ2: "active" is reference so model predicts the odds of churning
+    churned_year1       = factor(churned_year1, levels = c(0, 1),
+                                 labels = c("active", "churned")),
+    # centers personal training so the intercept is for an average-usage member
+    pt_c = personal_training_sessions - mean(personal_training_sessions)
+  )
+
+#groups by membership tier
+members |>
+  group_by(membership_tier) |>
+  describe_distribution(select = c("monthly_spend", "personal_training_sessions")) |>
+  display()
+```
+
+---
+
+# RQ1: Spending, personal training, and membership tier
+
+## 1. Analytic approach
+
+**RESPONSE:** 
+
+I will use multiple linear regression (OLS) with `monthly_spend` as the outcome, because spending is continuous and roughly symmetric. To test whether the personal-training relationship differs across tiers, I will include a personal-training × membership-tier interaction, which is a moderation test: it asks whether the slope of spending on training sessions is the same in all three tiers. The model will also adjust for the other member characteristics (age, tenure, home location, acquisition channel, and early engagement score), so each coefficient reflects the association holding the others constant. I will build the model hierarchically (covariates, then tier, then personal training, then the interaction) and compare steps with Wald F-tests, so I can see whether each addition improves fit. Personal training sessions are mean-centered, so the personal-training main effect is the slope for the reference tier (Basic) at average values of the other predictors.
+
+## 2. Model code
+
+```{r}
+#| label: rq1-models
+# Hierarchical build of my model
+rq1_m0 <- lm(monthly_spend ~ 1, data = members)
+
+rq1_m1 <- lm(monthly_spend ~ age + tenure_months + home_location +
+               acquisition_channel + baseline_engagement_score,
+             data = members)
+#adding another factor each time
+rq1_m2 <- update(rq1_m1, . ~ . + membership_tier)
+
+rq1_m3 <- update(rq1_m2, . ~ . + pt_c)
+
+rq1_m4 <- update(rq1_m3, . ~ . + pt_c:membership_tier)   # final model
+#wald test
+rq1_wald <- test_wald(rq1_m0, rq1_m1, rq1_m2, rq1_m3, rq1_m4)
+display(rq1_wald, digits = 3)
+```
+
+```{r}
+#| label: rq1-params
+# Final model parameters
+rq1_mpm <- model_parameters(rq1_m4, ci = 0.95)
+display(rq1_mpm, digits = 3)
+
+# Overall fit
+rq1_mpf <- model_performance(rq1_m4)
+display(rq1_mpf, digits = 3)
+
+# Direct test of the interaction (final model vs. same model without it)
+rq1_int_test <- test_wald(rq1_m3, rq1_m4)
+display(rq1_int_test, digits = 3)
+```
+
+```{r}
+#| label: rq1-slopes
+# Simple slope of personal training within each tier (dollars per extra session)
+rq1_slopes <- estimate_slopes(rq1_m4, trend = "pt_c", by = "membership_tier")
+display(rq1_slopes, digits = 2)
+```
+
+```{r}
+#| label: rq1-plot
+# Gives Raw data with a separate line for each tier (unadjusted)
+ggplot(members, aes(x = personal_training_sessions, y = monthly_spend,
+                    colour = membership_tier, fill = membership_tier)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.15) +
+  scale_colour_viridis_d(end = 0.8) +
+  scale_fill_viridis_d(end = 0.8) +
+  labs(x = "Personal-training sessions per month", y = "Monthly spend ($)",
+       colour = "Tier", fill = "Tier") +
+  theme_minimal()
+```
+
+**RESPONSE (code summary):** 
+I built the model in steps (covariates, then tier, then personal training, then the interaction) and compared each step with a Wald F-test. Personal training is mean-centered, and the reference groups are Basic (tier), Walk-in (channel), and Suburban (location). The key code is in the exam submission.
+
+
+## 3. Assumption check
+
+```{r}
+#| label: rq1-assumptions
+#| fig-height: 8
+
+# makes diagnostic plots (linearity, homogeneity of variance, influence, normality of residuals)
+check_model(rq1_m4)
+
+# Formal test of the assumption I am reporting (heteroskedasticity)
+check_heteroscedasticity(rq1_m4)
+
+# Supporting check: normality of residuals
+check_normality(rq1_m4)
+```
+
+```{r}
+#| label: rq1-collinearity
+# Collinearity is checked on the model WITHOUT the interaction, because
+# an interaction term is built from its components and inflates VIF by design.
+# Therefore, collinearity is just checked on m3.
+check_collinearity(rq1_m3) |> 
+  display(digits = 2)
+```
+
+```{r}
+#| label: rq1-robust
+#| eval: false
+
+# Same model, heteroskedasticity-consistent (HC3) standard errors:
+model_parameters(rq1_m4, vcov = "HC3") |> 
+  display(digits = 3)
+
+```
+
+**RESPONSE:** 
+
+The assumption I checked was constant variance in the residuals (homoscedasticity),because if the spread changes across fitted values, the standard errors and p-values can't be trusted. The test came back fine (p = 0.684), and the residual plots show an even band with no funnel shape. The residuals also looked normal (p = 0.234), no observation had unusual influence, and collinearity wasn't a problem (the largest VIF in the main-effects model was 1.48, for tier). The higher VIFs in the full-model plot come from the interaction term overlapping with its own components, which is expected. Since nothing was wrong, no fix was needed and I kept the ordinary OLS results. As a precaution I also re-ran the model with HC3 robust standard errors, and the conclusions didn't change: the same terms were significant (Social Ad p = 0.009, personal training p = .009, and both interactions p < 0.001) and the same terms were not (Referral p = 0.173, age p = 0.301, location p = 0.511).
+
+## 4. Key results
+
+**RESPONSE:** 
+Yes, the relationship between personal training and spending differs by tier. Adding the personal training × tier interaction significantly improved the model, F(2, 268) = 25.69, p < .001. Earlier steps also helped: the covariates beat the intercept-only model, F(6, 273) = 44.21, p < .001; tier added a lot, F(2, 271) = 2096.93, p < .001; and personal training added more, F(1, 270) = 247.83, p < .001. The full model explains about 95% of the variation in monthly spend (R² = .947, adjusted R² = .944). Training is linked to higher spending in every tier, but the payoff grows with the tier. Each extra personal-training session per month goes with $2.98 more spending for Basic members (95% CI [0.83, 5.14], p = .007), 7.74 more for Premium (95% CI [6.24, 9.25], p < .001), and $13.61 more for Elite (95% CI [11.65, 15.56], p < .001). Compared with Basic, the slope is $4.76 steeper for Premium (95% CI [2.13, 7.39], p < .001) and 10.62 steeper for Elite (95% CI [7.68, 13.57], p < .001). The scatterplot shows the same thing: an almost flat line for Basic and much steeper lines for Premium and Elite. Other characteristics also mattered. Members who had been around longer spent more (b = 0.37 more dollars per month of tenure, p < .001), and so did members with higher early engagement (b = 0.22 per point, p < .001). Social Ad members spent about 5.43 less per month than Walk-ins (95% CI [-9.25, -1.60], p = .006), while Referral members weren't significantly different from Walk-ins (p = .170). Age (p = .297) and home location (p = .495) weren't significant. Tier itself had a huge effect: at average training use, Premium members spent about $48 more than Basic members and Elite members about $111 more (both p < .001).
+
+## 5. Plain-language summary and recommendation
+
+**RESPONSE:** 
+Members who do more personal training spend more, but how much more depends on their
+membership level. Each extra session a month is tied to about $3 more spending for a Basic member, about $8 for a Premium member, and about $14 for an Elite member. That holds after accounting for age, how long they've been a member, where they live, how they joined, and how engaged they were early on. So personal training is most valuable among Premium and Elite members. Members who've been with PeakFit longer and those who were more engaged in their first two weeks also spend more, and members who joined through a social ad spend about $5 less per month than walk-ins.
+
+**Recommendation:** 
+Promote personal training to Premium and Elite members, for example with a free or
+discounted first session or a training package offered at sign-up or upgrade, since that's where each extra session is linked to the biggest increase in spending. This only shows an association, so it doesn't prove that training causes the extra spending (big spenders may just buy more of everything). I'd pilot the offer at a few locations and track results before rolling it out chain-wide.
+
+---
+
+# RQ2: Predicting first-year cancellation
+
+## 6. Analytic approach
+
+**RESPONSE:** 
+
+I'll use binary logistic regression, because the outcome is yes/no (cancelled within the
+first year or not). It models the odds of cancelling, so the coefficients convert directly into odds ratios, which is what the question asks for across acquisition channels. Walk-in is the reference group, so Referral and Social Ad are each compared with Walk-in. I'll also include age, tenure, home location, membership tier, and early engagement score. I left out personal-training sessions and monthly spend on purpose, since they're measured during membership and depend partly on how long someone stayed, so using them to predict cancellation would be circular. The early engagement score only covers the first 14 days, so it's fair to use. I included tenure because recent joiners have had less time to cancel. There are only 33 cancellations, so I kept the
+model small.
+
+## 7. Model code
+
+```{r}
+#| label: rq2-descriptives
+# gives quick look at the outcome by channel (row percentages)
+members |>
+  data_tabulate(select = "acquisition_channel", by = "churned_year1",
+                proportions = "row") |>
+  display(digits = 1)
+
+# done by umber of cancellations (events) relative to number of predictors
+members |> 
+  count(churned_year1) |> 
+  display()
+```
+
+```{r}
+#| label: rq2-models
+
+# i got the structure of this from the lectures 
+rq2_model <- glm(
+  churned_year1 ~ acquisition_channel + age + tenure_months + membership_tier +
+    home_location + baseline_engagement_score,
+  family = binomial(),
+  data = members
+)
+
+# Model vs. intercept-only (null) model
+rq2_lrt <- test_lrt(rq2_model)
+display(rq2_lrt, digits = 3)
+
+# Model fit
+rq2_mpf <- model_performance(rq2_model)
+display(rq2_mpf, digits = 3)
+
+```
+
+```{r}
+#| label: rq2-params
+# Log-odds
+rq2_mpm <- model_parameters(rq2_model)
+display(rq2_mpm, digits = 3)
+
+# Odds ratios
+rq2_or <- model_parameters(rq2_model, exponentiate = TRUE)
+display(rq2_or, digits = 3)
+
+# Predicted probability of cancelling by channel (other predictors at typical values)
+estimate_means(rq2_model, by = "acquisition_channel") |>
+  display(digits = 3)
+```
+
+```{r}
+#| label: rq2-assumptions
+#| fig-height: 8
+
+# Collinearity
+check_collinearity(rq2_model) |> 
+  display(digits = 2)
+
+# Diagnostic plots
+check_model(rq2_model)
+
+# Linearity of the logit for each continuous predictor (meaning x * log(x) test)
+rq2_logit_test <- glm(
+  churned_year1 ~ acquisition_channel + age + tenure_months + membership_tier +
+    home_location + baseline_engagement_score +
+    age:log(age) +
+    tenure_months:log(tenure_months) +
+    baseline_engagement_score:log(baseline_engagement_score),
+  family = binomial(),
+  data = members
+)
+model_parameters(rq2_logit_test) |> 
+  display(digits = 3)
+
+```
+
+**RESPONSE (code summary):** 
+Walk-in is the reference channel, and the outcome is coded so the model predicts the odds of cancelling. Key model is in the exam submission. For assumptions, all VIFs were 1.20 or lower, and none of the predictor × log(predictor) terms was significant (age p = .922, tenure p = .586, engagement p = .852), so the linearity-of-the-logit assumption looks fine. The diagnostic plots showed no influential cases. One caution is that 33 cancellations is a small number for eight predictors, so the estimates are less precise than they would be with more events.
+
+
+## 8. Overall model fit
+
+**RESPONSE:** 
+
+Yes. The full model fit significantly better than the intercept-only model, likelihood-ratio
+χ²(8) = 33.20, p < .001 (Tjur's R² = .141, AIC = 187.9). The predictors together separate members who cancelled from those who stayed better than chance, though a Tjur's R² of .14 means a good deal of cancellation is still unexplained.
+
+## 9. Acquisition channel and other predictors
+
+**RESPONSE:** 
+Acquisition channel matters a lot. Compared with Walk-in members, the odds of cancelling
+were about 81% lower for Referral members (OR = 0.19, 95% CI [0.06, 0.51], p = .002) and about 83% lower for Social Ad members (OR = 0.17, 95% CI [0.06, 0.44], p < .001), holding the other predictors constant. Flipped around, Walk-ins had roughly 5 to 6 times the odds of cancelling compared with either group. Referral and Social Ad looked about the same as each other. The raw rates tell the same story: 22.4% of Walk-ins cancelled, versus 8.3% of Referral and 8.5% of Social Ad members. After adjusting for the other predictors, the model estimates 19.2% for Walk-in, 4.3% for Referral, and 3.9% for Social Ad. The only other significant predictor was early engagement score. Each additional point was linked to 5% lower odds of cancelling (OR = 0.95, 95% CI [0.93, 0.98], p < .001), which works out to about 39% lower odds for every 10 points. Tenure (OR = 0.97, p = .071) and Elite tier (OR = 0.29, p = .071) leaned toward lower odds of cancelling but didn't reach significance. Age (p = .276), Premium tier (p = .366), and home location (p = .488) weren't significant.
+
+AI Disclosure: 
+**Response**
+
+I only used it to see if I had everything. Everything else, I used the stuff given by the professor to finish the exam. 
+
